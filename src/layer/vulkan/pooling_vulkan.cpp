@@ -1,42 +1,85 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "pooling_vulkan.h"
-#include <float.h>
-#include <algorithm>
+
+#include "layer_shader_type.h"
 #include "layer_type.h"
 
-namespace ncnn {
+#include <float.h>
 
-DEFINE_LAYER_CREATOR(Pooling_vulkan)
+namespace ncnn {
 
 Pooling_vulkan::Pooling_vulkan()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     padding = 0;
     pipeline_pooling = 0;
-    pipeline_pooling_global = 0;
     pipeline_pooling_pack4 = 0;
-    pipeline_pooling_global_pack4 = 0;
+
+    pipeline_pooling_adaptive = 0;
+    pipeline_pooling_adaptive_pack4 = 0;
+
+    pipeline_pooling_global_reduce_first = 0;
+    pipeline_pooling_global_reduce_first_pack4 = 0;
+    pipeline_pooling_global_reduce = 0;
+    pipeline_pooling_global_reduce_pack4 = 0;
+    pipeline_pooling_global_reduce_last = 0;
+    pipeline_pooling_global_reduce_last_pack4 = 0;
 }
 
 int Pooling_vulkan::create_pipeline(const Option& opt)
 {
+    const Mat& shape = bottom_shapes.empty() ? Mat() : bottom_shapes[0];
+    const Mat& out_shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
+    // the shape after padding
+    Mat shape_bordered;
+    if (shape.dims != 0)
     {
-        padding = ncnn::create_layer(ncnn::LayerType::Padding);
+        if (pad_mode == 0)
+        {
+            int wtail = (shape.w + pad_left + pad_right - kernel_w) % stride_w;
+            int htail = (shape.h + pad_top + pad_bottom - kernel_h) % stride_h;
+
+            int wtailpad = 0;
+            int htailpad = 0;
+            if (wtail != 0)
+                wtailpad = stride_w - wtail;
+            if (htail != 0)
+                htailpad = stride_h - htail;
+
+            shape_bordered = Mat(shape.w + pad_left + pad_right + wtailpad, shape.h + pad_top + pad_bottom + htailpad, shape.c, (void*)0, shape.elemsize, shape.elempack);
+        }
+        else if (pad_mode == 1)
+        {
+            shape_bordered = Mat(shape.w + pad_left + pad_right, shape.h + pad_top + pad_bottom, shape.c, (void*)0, shape.elemsize, shape.elempack);
+        }
+        else if (pad_mode == 2 || pad_mode == 3)
+        {
+            int wpad = kernel_w + (shape.w - 1) / stride_w * stride_w - shape.w;
+            int hpad = kernel_h + (shape.h - 1) / stride_h * stride_h - shape.h;
+            if (wpad > 0 || hpad > 0)
+            {
+                shape_bordered = Mat(shape.w + wpad, shape.h + hpad, shape.c, (void*)0, shape.elemsize, shape.elempack);
+            }
+        }
+        else
+        {
+            shape_bordered = shape;
+        }
+    }
+
+    {
+        padding = ncnn::create_layer_vulkan(ncnn::LayerType::Padding);
         padding->vkdev = vkdev;
+
+        padding->bottom_shapes.resize(1);
+        padding->bottom_shapes[0] = shape;
+        padding->top_shapes.resize(1);
+        padding->top_shapes[0] = shape_bordered;
 
         ncnn::ParamDict pd;
         pd.set(0, pad_top);
@@ -47,7 +90,12 @@ int Pooling_vulkan::create_pipeline(const Option& opt)
 
         if (pooling_type == PoolMethod_MAX)
         {
-            pd.set(5, -FLT_MAX);
+            // FLT_MAX becomes NaN during fp16 conversion in shader with swiftshader
+            // use a proper fp16-representable max as workaround   --- nihui
+            if (opt.use_fp16_packed || opt.use_fp16_storage || opt.use_fp16_arithmetic)
+                pd.set(5, -65000.f);
+            else
+                pd.set(5, -FLT_MAX);
         }
         else if (pooling_type == PoolMethod_AVE)
         {
@@ -59,51 +107,190 @@ int Pooling_vulkan::create_pipeline(const Option& opt)
         padding->create_pipeline(opt);
     }
 
-    std::vector<vk_specialization_type> specializations(12);
-    specializations[0].i = pooling_type;
-    specializations[1].i = kernel_w;
-    specializations[2].i = kernel_h;
-    specializations[3].i = stride_w;
-    specializations[4].i = stride_h;
-    specializations[5].i = pad_left;
-    specializations[6].i = pad_right;
-    specializations[7].i = pad_top;
-    specializations[8].i = pad_bottom;
-    specializations[9].i = global_pooling;
-    specializations[10].i = pad_mode;
-    specializations[11].i = avgpool_count_include_pad;
-
-    // pack1
-    {
-        pipeline_pooling = new Pipeline(vkdev);
-        pipeline_pooling->set_optimal_local_size_xyz();
-        pipeline_pooling->create("pooling", opt, specializations, 2, 12);
-    }
-
-    // pack4
-    {
-        pipeline_pooling_pack4 = new Pipeline(vkdev);
-        pipeline_pooling_pack4->set_optimal_local_size_xyz();
-        pipeline_pooling_pack4->create("pooling_pack4", opt, specializations, 2, 12);
-    }
-
     if (global_pooling)
     {
-        std::vector<vk_specialization_type> specializations(1);
+        // reduce first
+        {
+            std::vector<vk_specialization_type> specializations(6);
+            specializations[0].i = shape_bordered.w;
+            specializations[1].i = shape_bordered.h;
+            specializations[2].i = shape_bordered.c;
+            specializations[3].i = shape_bordered.cstep;
+            specializations[4].i = 0;
+            specializations[5].i = 0;
+
+            Mat local_size_xyz(64, 1, 1, (void*)0);
+
+            // pack1
+            if (shape.dims == 0 || shape.elempack == 1)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max_first : LayerShaderType::pooling_global_reduce_sum_first;
+
+                pipeline_pooling_global_reduce_first = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce_first->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce_first->create(layer_shader_type, opt, specializations);
+            }
+
+            // pack4
+            if (shape.dims == 0 || shape.elempack == 4)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max_first_pack4 : LayerShaderType::pooling_global_reduce_sum_first_pack4;
+
+                pipeline_pooling_global_reduce_first_pack4 = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce_first_pack4->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce_first_pack4->create(layer_shader_type, opt, specializations);
+            }
+        }
+
+        // reduce more
+        {
+            std::vector<vk_specialization_type> specializations(5);
+            specializations[0].i = 0;
+            specializations[1].i = shape_bordered.c;
+            specializations[2].i = 0;
+            specializations[3].i = 0;
+            specializations[4].i = 0;
+
+            Mat local_size_xyz(64, 1, 1, (void*)0);
+
+            // pack1
+            if (shape.dims == 0 || shape.elempack == 1)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max : LayerShaderType::pooling_global_reduce_sum;
+
+                pipeline_pooling_global_reduce = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce->create(layer_shader_type, opt, specializations);
+            }
+
+            // pack4
+            if (shape.dims == 0 || shape.elempack == 4)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max_pack4 : LayerShaderType::pooling_global_reduce_sum_pack4;
+
+                pipeline_pooling_global_reduce_pack4 = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce_pack4->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce_pack4->create(layer_shader_type, opt, specializations);
+            }
+        }
+
+        // reduce last
+        {
+            std::vector<vk_specialization_type> specializations(3);
+            specializations[0].i = 0;
+            specializations[1].i = shape_bordered.c;
+            specializations[2].i = 0;
+
+            Mat local_size_xyz(1, 1, 64, (void*)0);
+
+            // pack1
+            if (shape.dims == 0 || shape.elempack == 1)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max_last : LayerShaderType::pooling_global_reduce_sum_last;
+
+                pipeline_pooling_global_reduce_last = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce_last->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce_last->create(layer_shader_type, opt, specializations);
+            }
+
+            // pack4
+            if (shape.dims == 0 || shape.elempack == 4)
+            {
+                int layer_shader_type = pooling_type == 0 ? LayerShaderType::pooling_global_reduce_max_last_pack4 : LayerShaderType::pooling_global_reduce_sum_last_pack4;
+
+                pipeline_pooling_global_reduce_last_pack4 = new Pipeline(vkdev);
+                pipeline_pooling_global_reduce_last_pack4->set_optimal_local_size_xyz(local_size_xyz);
+                pipeline_pooling_global_reduce_last_pack4->create(layer_shader_type, opt, specializations);
+            }
+        }
+    }
+    else if (adaptive_pooling)
+    {
+        std::vector<vk_specialization_type> specializations(1 + 10);
         specializations[0].i = pooling_type;
+        specializations[1 + 0].i = shape_bordered.dims;
+        specializations[1 + 1].i = shape_bordered.w;
+        specializations[1 + 2].i = shape_bordered.h;
+        specializations[1 + 3].i = shape_bordered.c;
+        specializations[1 + 4].i = shape_bordered.cstep;
+        specializations[1 + 5].i = out_shape.dims;
+        specializations[1 + 6].i = out_shape.w;
+        specializations[1 + 7].i = out_shape.h;
+        specializations[1 + 8].i = out_shape.c;
+        specializations[1 + 9].i = out_shape.cstep;
+
+        Mat local_size_xyz;
+        if (out_shape.dims != 0)
+        {
+            local_size_xyz.w = std::min(4, out_shape.w);
+            local_size_xyz.h = std::min(4, out_shape.h);
+            local_size_xyz.c = std::min(4, out_shape.c);
+        }
 
         // pack1
+        if (shape.dims == 0 || shape.elempack == 1)
         {
-            pipeline_pooling_global = new Pipeline(vkdev);
-            pipeline_pooling_global->set_optimal_local_size_xyz(256, 1, 1);
-            pipeline_pooling_global->create("pooling_global", opt, specializations, 2, 12);
+            pipeline_pooling_adaptive = new Pipeline(vkdev);
+            pipeline_pooling_adaptive->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_pooling_adaptive->create(LayerShaderType::pooling_adaptive, opt, specializations);
         }
 
         // pack4
+        if (shape.dims == 0 || shape.elempack == 4)
         {
-            pipeline_pooling_global_pack4 = new Pipeline(vkdev);
-            pipeline_pooling_global_pack4->set_optimal_local_size_xyz(256, 1, 1);
-            pipeline_pooling_global_pack4->create("pooling_global_pack4", opt, specializations, 2, 12);
+            pipeline_pooling_adaptive_pack4 = new Pipeline(vkdev);
+            pipeline_pooling_adaptive_pack4->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_pooling_adaptive_pack4->create(LayerShaderType::pooling_adaptive_pack4, opt, specializations);
+        }
+    }
+    else
+    {
+        std::vector<vk_specialization_type> specializations(12 + 10);
+        specializations[0].i = pooling_type;
+        specializations[1].i = kernel_w;
+        specializations[2].i = kernel_h;
+        specializations[3].i = stride_w;
+        specializations[4].i = stride_h;
+        specializations[5].i = pad_left;
+        specializations[6].i = pad_right;
+        specializations[7].i = pad_top;
+        specializations[8].i = pad_bottom;
+        specializations[9].i = global_pooling;
+        specializations[10].i = pad_mode;
+        specializations[11].i = avgpool_count_include_pad;
+        specializations[12 + 0].i = shape_bordered.dims;
+        specializations[12 + 1].i = shape_bordered.w;
+        specializations[12 + 2].i = shape_bordered.h;
+        specializations[12 + 3].i = shape_bordered.c;
+        specializations[12 + 4].i = shape_bordered.cstep;
+        specializations[12 + 5].i = out_shape.dims;
+        specializations[12 + 6].i = out_shape.w;
+        specializations[12 + 7].i = out_shape.h;
+        specializations[12 + 8].i = out_shape.c;
+        specializations[12 + 9].i = out_shape.cstep;
+
+        Mat local_size_xyz;
+        if (out_shape.dims != 0)
+        {
+            local_size_xyz.w = std::min(4, out_shape.w);
+            local_size_xyz.h = std::min(4, out_shape.h);
+            local_size_xyz.c = std::min(4, out_shape.c);
+        }
+
+        // pack1
+        if (shape.dims == 0 || shape.elempack == 1)
+        {
+            pipeline_pooling = new Pipeline(vkdev);
+            pipeline_pooling->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_pooling->create(LayerShaderType::pooling, opt, specializations);
+        }
+
+        // pack4
+        if (shape.dims == 0 || shape.elempack == 4)
+        {
+            pipeline_pooling_pack4 = new Pipeline(vkdev);
+            pipeline_pooling_pack4->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_pooling_pack4->create(LayerShaderType::pooling_pack4, opt, specializations);
         }
     }
 
@@ -125,11 +312,39 @@ int Pooling_vulkan::destroy_pipeline(const Option& opt)
     delete pipeline_pooling_pack4;
     pipeline_pooling_pack4 = 0;
 
-    delete pipeline_pooling_global;
-    pipeline_pooling_global = 0;
+    delete pipeline_pooling_adaptive;
+    pipeline_pooling_adaptive = 0;
 
-    delete pipeline_pooling_global_pack4;
-    pipeline_pooling_global_pack4 = 0;
+    delete pipeline_pooling_adaptive_pack4;
+    pipeline_pooling_adaptive_pack4 = 0;
+
+    delete pipeline_pooling_global_reduce_first;
+    pipeline_pooling_global_reduce_first = 0;
+
+    delete pipeline_pooling_global_reduce_first_pack4;
+    pipeline_pooling_global_reduce_first_pack4 = 0;
+
+    delete pipeline_pooling_global_reduce;
+    pipeline_pooling_global_reduce = 0;
+
+    delete pipeline_pooling_global_reduce_pack4;
+    pipeline_pooling_global_reduce_pack4 = 0;
+
+    delete pipeline_pooling_global_reduce_last;
+    pipeline_pooling_global_reduce_last = 0;
+
+    delete pipeline_pooling_global_reduce_last_pack4;
+    pipeline_pooling_global_reduce_last_pack4 = 0;
+
+    return 0;
+}
+
+int Pooling_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
+{
+    if (padding)
+    {
+        padding->upload_model(cmd, opt);
+    }
 
     return 0;
 }
@@ -144,7 +359,111 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
 
     if (global_pooling)
     {
-        top_blob.create(channels, elemsize, elempack, opt.blob_vkallocator, opt.staging_vkallocator);
+        // reduce first
+        VkMat reduced_blob;
+        {
+            int reduced_size = (w * h + 7) / 8;
+            size_t reduced_elemsize = pooling_type == 0 ? elemsize : 4u * elempack;
+            reduced_blob.create(reduced_size, 1, channels, reduced_elemsize, elempack, opt.workspace_vkallocator);
+            if (reduced_blob.empty())
+                return -100;
+
+            std::vector<VkMat> bindings(2);
+            bindings[0] = bottom_blob;
+            bindings[1] = reduced_blob;
+
+            std::vector<vk_constant_type> constants(6);
+            constants[0].i = bottom_blob.w;
+            constants[1].i = bottom_blob.h;
+            constants[2].i = bottom_blob.c;
+            constants[3].i = bottom_blob.cstep;
+            constants[4].i = reduced_blob.w;
+            constants[5].i = reduced_blob.cstep;
+
+            const Pipeline* pipeline = elempack == 4 ? pipeline_pooling_global_reduce_first_pack4 : pipeline_pooling_global_reduce_first;
+
+            VkMat dispatcher;
+            dispatcher.w = reduced_blob.w;
+            dispatcher.h = 1;
+            dispatcher.c = bottom_blob.c;
+
+            cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+        }
+
+        // reduce more
+        while (reduced_blob.w > 32)
+        {
+            int reduced_size = (reduced_blob.w + 7) / 8;
+            size_t reduced_elemsize = pooling_type == 0 ? elemsize : 4u * elempack;
+            VkMat reduced_blob2;
+            reduced_blob2.create(reduced_size, 1, channels, reduced_elemsize, elempack, opt.workspace_vkallocator);
+            if (reduced_blob2.empty())
+                return -100;
+
+            std::vector<VkMat> bindings(2);
+            bindings[0] = reduced_blob;
+            bindings[1] = reduced_blob2;
+
+            std::vector<vk_constant_type> constants(5);
+            constants[0].i = reduced_blob.w;
+            constants[1].i = reduced_blob.c;
+            constants[2].i = reduced_blob.cstep;
+            constants[3].i = reduced_blob2.w;
+            constants[4].i = reduced_blob2.cstep;
+
+            const Pipeline* pipeline = elempack == 4 ? pipeline_pooling_global_reduce_pack4 : pipeline_pooling_global_reduce;
+
+            VkMat dispatcher;
+            dispatcher.w = reduced_blob2.w;
+            dispatcher.h = 1;
+            dispatcher.c = reduced_blob2.c;
+
+            cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+
+            reduced_blob = reduced_blob2;
+        }
+
+        // reduce last
+        {
+            top_blob.create(channels, elemsize, elempack, opt.blob_vkallocator);
+            if (top_blob.empty())
+                return -100;
+
+            std::vector<VkMat> bindings(2);
+            bindings[0] = reduced_blob;
+            bindings[1] = top_blob;
+
+            std::vector<vk_constant_type> constants(4);
+            constants[0].i = reduced_blob.w;
+            constants[1].i = reduced_blob.c;
+            constants[2].i = reduced_blob.cstep;
+            constants[3].i = w * h;
+
+            const Pipeline* pipeline = elempack == 4 ? pipeline_pooling_global_reduce_last_pack4 : pipeline_pooling_global_reduce_last;
+
+            VkMat dispatcher;
+            dispatcher.w = 1;
+            dispatcher.h = 1;
+            dispatcher.c = top_blob.w;
+
+            cmd.record_pipeline(pipeline, bindings, constants, dispatcher);
+        }
+
+        return 0;
+    }
+
+    if (adaptive_pooling)
+    {
+        int _out_w = out_w == -233 ? w : out_w;
+        int _out_h = out_h == -233 ? h : out_h;
+
+        if (_out_w == w && _out_h == h)
+        {
+            top_blob = bottom_blob;
+            return 0;
+        }
+
+        top_blob.create(_out_w, _out_h, channels, elemsize, elempack, opt.blob_vkallocator);
         if (top_blob.empty())
             return -100;
 
@@ -152,7 +471,7 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
         bindings[0] = bottom_blob;
         bindings[1] = top_blob;
 
-        std::vector<vk_constant_type> constants(12);
+        std::vector<vk_constant_type> constants(10);
         constants[0].i = bottom_blob.dims;
         constants[1].i = bottom_blob.w;
         constants[2].i = bottom_blob.h;
@@ -163,10 +482,8 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
         constants[7].i = top_blob.h;
         constants[8].i = top_blob.c;
         constants[9].i = top_blob.cstep;
-        constants[10].i = 0;
-        constants[11].i = 0;
 
-        const Pipeline* pipeline = elempack == 4 ? pipeline_pooling_global_pack4 : pipeline_pooling_global;
+        const Pipeline* pipeline = elempack == 4 ? pipeline_pooling_adaptive_pack4 : pipeline_pooling_adaptive;
 
         cmd.record_pipeline(pipeline, bindings, constants, top_blob);
 
@@ -191,14 +508,15 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
         Option opt_pad = opt;
         opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
-        VkMat padding_param_blob(4, (size_t)4u, 1, opt.staging_vkallocator, opt.staging_vkallocator);
-        padding_param_blob.prepare_staging_buffer();
+        VkMat padding_param_blob(6, (size_t)4u, 1, opt.staging_vkallocator);
         int* padding_params = padding_param_blob.mapped();
 
         padding_params[0] = pad_top;
         padding_params[1] = pad_bottom + htailpad;
         padding_params[2] = pad_left;
         padding_params[3] = pad_right + wtailpad;
+        padding_params[4] = 0;
+        padding_params[5] = 0;
 
         std::vector<VkMat> padding_inputs(2);
         padding_inputs[0] = bottom_blob;
@@ -224,14 +542,15 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
             Option opt_pad = opt;
             opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
-            VkMat padding_param_blob(4, (size_t)4u, 1, opt.staging_vkallocator, opt.staging_vkallocator);
-            padding_param_blob.prepare_staging_buffer();
+            VkMat padding_param_blob(6, (size_t)4u, 1, opt.staging_vkallocator);
             int* padding_params = padding_param_blob.mapped();
 
             padding_params[0] = hpad / 2;
             padding_params[1] = hpad - hpad / 2;
             padding_params[2] = wpad / 2;
             padding_params[3] = wpad - wpad / 2;
+            padding_params[4] = 0;
+            padding_params[5] = 0;
 
             std::vector<VkMat> padding_inputs(2);
             padding_inputs[0] = bottom_blob;
@@ -251,14 +570,15 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
             Option opt_pad = opt;
             opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
-            VkMat padding_param_blob(4, (size_t)4u, 1, opt.staging_vkallocator, opt.staging_vkallocator);
-            padding_param_blob.prepare_staging_buffer();
+            VkMat padding_param_blob(6, (size_t)4u, 1, opt.staging_vkallocator);
             int* padding_params = padding_param_blob.mapped();
 
             padding_params[0] = hpad - hpad / 2;
             padding_params[1] = hpad / 2;
             padding_params[2] = wpad - wpad / 2;
             padding_params[3] = wpad / 2;
+            padding_params[4] = 0;
+            padding_params[5] = 0;
 
             std::vector<VkMat> padding_inputs(2);
             padding_inputs[0] = bottom_blob;
@@ -276,7 +596,7 @@ int Pooling_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     int outw = (w - kernel_w) / stride_w + 1;
     int outh = (h - kernel_h) / stride_h + 1;
 
-    top_blob.create(outw, outh, channels, elemsize, elempack, opt.blob_vkallocator, opt.staging_vkallocator);
+    top_blob.create(outw, outh, channels, elemsize, elempack, opt.blob_vkallocator);
     if (top_blob.empty())
         return -100;
 

@@ -1,16 +1,5 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #ifndef LAYER_INNERPRODUCT_VULKAN_H
 #define LAYER_INNERPRODUCT_VULKAN_H
@@ -19,7 +8,7 @@
 
 namespace ncnn {
 
-class InnerProduct_vulkan : virtual public InnerProduct
+class InnerProduct_vulkan : public InnerProduct
 {
 public:
     InnerProduct_vulkan();
@@ -35,25 +24,17 @@ public:
 public:
     ncnn::Layer* flatten;
 
+    Mat weight_data_packed;
+
     VkMat weight_data_gpu;
     VkMat bias_data_gpu;
 
     Pipeline* pipeline_innerproduct;
 
-    VkMat bias_data_gpu_pack4;
+    Pipeline* pipeline_innerproduct_sum8;
+    Pipeline* pipeline_innerproduct_reduce_sum8;
 
-    // pack4
-    VkMat weight_data_gpu_pack4;
-    Pipeline* pipeline_innerproduct_pack4;
-    Pipeline* pipeline_innerproduct_pack4_lds_64;
-
-    // pack1to4
-    VkMat weight_data_gpu_pack1to4;
-    Pipeline* pipeline_innerproduct_pack1to4;
-
-    // pack4to1
-    VkMat weight_data_gpu_pack4to1;
-    Pipeline* pipeline_innerproduct_pack4to1;
+    Pipeline* pipeline_innerproduct_gemm;
 };
 
 } // namespace ncnn

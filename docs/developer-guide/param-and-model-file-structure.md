@@ -25,9 +25,9 @@ Softmax       softmax  1 1 fc prob 0=0
 * layer name : name of this layer, must be unique among all layer names
 * input count : count of the blobs this layer needs as input
 * output count : count of the blobs this layer produces as output
-* input blobs : name list of all the input blob names, seperated by space, must be unique among input blob names of all layers
-* output blobs : name list of all the output blob names, seperated by space, must be unique among output blob names of all layers
-* layer specific params : key=value pair list, seperated by space
+* input blobs : name list of all the input blob names, separated by space, must be unique among input blob names of all layers
+* output blobs : name list of all the output blob names, separated by space, must be unique among output blob names of all layers
+* layer specific params : key=value pair list, separated by space
 ### layer param
 ```
 0=1 1=2.5 -23303=2,2.0,3.0
@@ -42,6 +42,11 @@ the meaning of existing param key index can be looked up at [operation-param-wei
 * integer array or float array key : -23300 minus index 0 ~ 19
 * integer array value : [array size],int,int,...,int
 * float array value : [array size],float,float,...,float
+
+In modern ncnn param file
+
+* array could be represented as `3=2.0,3.0` that is much more human friendly
+* string typed value: `4=hello` and the string is no longer than 255
 
 ## net.bin
 ```

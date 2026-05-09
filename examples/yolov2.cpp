@@ -1,28 +1,17 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2018 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2018 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
-#include <stdio.h>
-#include <vector>
+#include "net.h"
+
+#if defined(USE_NCNN_SIMPLEOCV)
+#include "simpleocv.h"
+#else
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-
-#include "platform.h"
-#include "net.h"
-#if NCNN_VULKAN
-#include "gpu.h"
-#endif // NCNN_VULKAN
+#endif
+#include <stdio.h>
+#include <vector>
 
 struct Object
 {
@@ -35,16 +24,16 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
 {
     ncnn::Net yolov2;
 
-#if NCNN_VULKAN
     yolov2.opt.use_vulkan_compute = true;
-#endif // NCNN_VULKAN
 
     // original pretrained model from https://github.com/eric612/MobileNet-YOLO
     // https://github.com/eric612/MobileNet-YOLO/blob/master/models/yolov2/mobilenet_yolo_deploy.prototxt
     // https://github.com/eric612/MobileNet-YOLO/blob/master/models/yolov2/mobilenet_yolo_deploy_iter_80000.caffemodel
     // the ncnn model https://github.com/nihui/ncnn-assets/tree/master/models
-    yolov2.load_param("mobilenet_yolo.param");
-    yolov2.load_model("mobilenet_yolo.bin");
+    if (yolov2.load_param("mobilenet_yolo.param"))
+        exit(-1);
+    if (yolov2.load_model("mobilenet_yolo.bin"))
+        exit(-1);
 
     const int target_size = 416;
 
@@ -61,16 +50,15 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
     in.substract_mean_normalize(mean_vals, 0);
 
     ncnn::Extractor ex = yolov2.create_extractor();
-    ex.set_num_threads(4);
 
     ex.input("data", in);
 
     ncnn::Mat out;
     ex.extract("detection_out", out);
 
-//     printf("%d %d %d\n", out.w, out.h, out.c);
+    //     printf("%d %d %d\n", out.w, out.h, out.c);
     objects.clear();
-    for (int i=0; i<out.h; i++)
+    for (int i = 0; i < out.h; i++)
     {
         const float* values = out.row(i);
 
@@ -91,11 +79,12 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
 static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
 {
     static const char* class_names[] = {"background",
-        "aeroplane", "bicycle", "bird", "boat",
-        "bottle", "bus", "car", "cat", "chair",
-        "cow", "diningtable", "dog", "horse",
-        "motorbike", "person", "pottedplant",
-        "sheep", "sofa", "train", "tvmonitor"};
+                                        "aeroplane", "bicycle", "bird", "boat",
+                                        "bottle", "bus", "car", "cat", "chair",
+                                        "cow", "diningtable", "dog", "horse",
+                                        "motorbike", "person", "pottedplant",
+                                        "sheep", "sofa", "train", "tvmonitor"
+                                       };
 
     cv::Mat image = bgr.clone();
 
@@ -121,8 +110,7 @@ static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
         if (x + label_size.width > image.cols)
             x = image.cols - label_size.width;
 
-        cv::rectangle(image, cv::Rect(cv::Point(x, y),
-                                      cv::Size(label_size.width, label_size.height + baseLine)),
+        cv::rectangle(image, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)),
                       cv::Scalar(255, 255, 255), -1);
 
         cv::putText(image, text, cv::Point(x, y + label_size.height),
@@ -150,16 +138,8 @@ int main(int argc, char** argv)
         return -1;
     }
 
-#if NCNN_VULKAN
-    ncnn::create_gpu_instance();
-#endif // NCNN_VULKAN
-
     std::vector<Object> objects;
     detect_yolov2(m, objects);
-
-#if NCNN_VULKAN
-    ncnn::destroy_gpu_instance();
-#endif // NCNN_VULKAN
 
     draw_objects(m, objects);
 

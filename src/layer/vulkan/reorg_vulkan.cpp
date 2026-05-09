@@ -1,26 +1,16 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "reorg_vulkan.h"
 
-namespace ncnn {
+#include "layer_shader_type.h"
 
-DEFINE_LAYER_CREATOR(Reorg_vulkan)
+namespace ncnn {
 
 Reorg_vulkan::Reorg_vulkan()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     pipeline_reorg = 0;
     pipeline_reorg_pack4 = 0;
@@ -29,28 +19,53 @@ Reorg_vulkan::Reorg_vulkan()
 
 int Reorg_vulkan::create_pipeline(const Option& opt)
 {
-    std::vector<vk_specialization_type> specializations(1);
+    const Mat& shape = bottom_shapes.empty() ? Mat() : bottom_shapes[0];
+    const Mat& out_shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
+    std::vector<vk_specialization_type> specializations(2 + 10);
     specializations[0].i = stride;
+    specializations[1].i = mode;
+    specializations[2 + 0].i = shape.dims;
+    specializations[2 + 1].i = shape.w;
+    specializations[2 + 2].i = shape.h;
+    specializations[2 + 3].i = shape.c;
+    specializations[2 + 4].i = shape.cstep;
+    specializations[2 + 5].i = out_shape.dims;
+    specializations[2 + 6].i = out_shape.w;
+    specializations[2 + 7].i = out_shape.h;
+    specializations[2 + 8].i = out_shape.c;
+    specializations[2 + 9].i = out_shape.cstep;
+
+    Mat local_size_xyz;
+    if (out_shape.dims != 0)
+    {
+        local_size_xyz.w = std::min(4, out_shape.w);
+        local_size_xyz.h = std::min(4, out_shape.h);
+        local_size_xyz.c = std::min(4, out_shape.c);
+    }
 
     // pack1
+    if (shape.dims == 0 || (shape.elempack == 1 && out_shape.elempack == 1))
     {
         pipeline_reorg = new Pipeline(vkdev);
-        pipeline_reorg->set_optimal_local_size_xyz();
-        pipeline_reorg->create("reorg", opt, specializations, 2, 10);
+        pipeline_reorg->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_reorg->create(LayerShaderType::reorg, opt, specializations);
     }
 
     // pack4
+    if (shape.dims == 0 || (shape.elempack == 4 && out_shape.elempack == 4))
     {
         pipeline_reorg_pack4 = new Pipeline(vkdev);
-        pipeline_reorg_pack4->set_optimal_local_size_xyz();
-        pipeline_reorg_pack4->create("reorg_pack4", opt, specializations, 2, 10);
+        pipeline_reorg_pack4->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_reorg_pack4->create(LayerShaderType::reorg_pack4, opt, specializations);
     }
 
     // pack1to4
+    if (shape.dims == 0 || (shape.elempack == 1 && out_shape.elempack == 4))
     {
         pipeline_reorg_pack1to4 = new Pipeline(vkdev);
-        pipeline_reorg_pack1to4->set_optimal_local_size_xyz();
-        pipeline_reorg_pack1to4->create("reorg_pack1to4", opt, specializations, 2, 10);
+        pipeline_reorg_pack1to4->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_reorg_pack1to4->create(LayerShaderType::reorg_pack1to4, opt, specializations);
     }
 
     return 0;
@@ -85,13 +100,7 @@ int Reorg_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& 
     int out_elempack = outc % 4 == 0 ? 4 : 1;
     size_t out_elemsize = elemsize / elempack * out_elempack;
 
-    if (opt.use_fp16_packed && !opt.use_fp16_storage)
-    {
-        if (out_elempack == 4) out_elemsize = 4*2u;
-        if (out_elempack == 1) out_elemsize = 4u;
-    }
-
-    top_blob.create(outw, outh, outc / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator, opt.staging_vkallocator);
+    top_blob.create(outw, outh, outc / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
     if (top_blob.empty())
         return -100;
 
@@ -116,7 +125,7 @@ int Reorg_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& 
     {
         pipeline = pipeline_reorg;
     }
-    else if (elempack == 4) // assert out_elempack == 4
+    else if (elempack == 4 && out_elempack == 4)
     {
         pipeline = pipeline_reorg_pack4;
     }

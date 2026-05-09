@@ -1,46 +1,41 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #version 450
 
-#if NCNN_fp16_storage
-#extension GL_EXT_shader_16bit_storage: require
-#endif
-#if NCNN_fp16_arithmetic
-#extension GL_AMD_gpu_shader_half_float: require
-#endif
+layout(constant_id = 0) const int axis = 0;
 
-layout (constant_id = 0) const int axis = 0;
+#define shape_constant_id_offset 1
+layout(constant_id = shape_constant_id_offset + 0) const int dims = 0;
+layout(constant_id = shape_constant_id_offset + 1) const int w = 0;
+layout(constant_id = shape_constant_id_offset + 2) const int h = 0;
+layout(constant_id = shape_constant_id_offset + 3) const int d = 0;
+layout(constant_id = shape_constant_id_offset + 4) const int c = 0;
+layout(constant_id = shape_constant_id_offset + 5) const int cstep = 0;
 
-layout (local_size_x_id = 233) in;
-layout (local_size_y_id = 234) in;
-layout (local_size_z_id = 235) in;
+layout(constant_id = shape_constant_id_offset + 6) const int outdims = 0;
+layout(constant_id = shape_constant_id_offset + 7) const int outw = 0;
+layout(constant_id = shape_constant_id_offset + 8) const int outh = 0;
+layout(constant_id = shape_constant_id_offset + 9) const int outd = 0;
+layout(constant_id = shape_constant_id_offset + 10) const int outc = 0;
+layout(constant_id = shape_constant_id_offset + 11) const int outcstep = 0;
 
-layout (binding = 0) readonly buffer bottom_blob { sfpvec4 bottom_blob_data[]; };
-layout (binding = 1) writeonly buffer top_blob { sfp top_blob_data[]; };
+layout(binding = 0) readonly buffer bottom_blob { sfpvec4 bottom_blob_data[]; };
+layout(binding = 1) writeonly buffer top_blob { sfp top_blob_data[]; };
 
-layout (push_constant) uniform parameter
+layout(push_constant) uniform parameter
 {
     int dims;
     int w;
     int h;
+    int d;
     int c;
     int cstep;
 
     int outdims;
     int outw;
     int outh;
+    int outd;
     int outc;
     int outcstep;
 
@@ -53,56 +48,47 @@ void main()
     int gy = int(gl_GlobalInvocationID.y);
     int gz = int(gl_GlobalInvocationID.z);
 
-    if (gx >= p.w || gy >= p.h || gz >= p.c)
+    if (gx >= psc(w) || gy >= psc(h) * psc(d) || gz >= psc(c))
         return;
 
-    ivec4 v_offset;
-    int gi;
+    int positive_axis = axis < 0 ? psc(dims) + axis : axis;
 
-    if (p.dims == 1) // axis == 0
+    ivec3 gxyz;
+
+    if (psc(dims) == 4)
     {
-        v_offset = ivec4(gx * 4 + p.offset) + ivec4(0, 1, 2, 3);
-        gi = gx;
+        int yd = gy / psc(h);
+        int yh = gy % psc(h);
+
+        ivec4 gxydz = ivec4(gx, yh, yd, gz);
+        gxydz[psc(dims) - 1] *= 4;
+        gxydz[psc(dims) - 1 - positive_axis] += p.offset;
+
+        gxyz = ivec3(gxydz.r, gxydz.g + gxydz.b * psc(outh), gxydz.a);
     }
-    else if (p.dims == 2 && axis == 0)
+    else
     {
-        v_offset = (ivec4(gx * 4 + p.offset) + ivec4(0, 1, 2, 3)) * p.outw + gx;
-        gi = gy * p.w + gx;
-    }
-    else if (p.dims == 2 && axis == 1)
-    {
-        v_offset = (ivec4(gx * 4) + ivec4(0, 1, 2, 3)) * p.outw + gx + p.offset;
-        gi = gy * p.w + gx;
-    }
-    else if (p.dims == 3 && axis == 0)
-    {
-        v_offset = (ivec4(gz * 4 + p.offset) + ivec4(0, 1, 2, 3)) * p.outcstep + gy * p.outw + gx;
-        gi = gz * p.cstep + gy * p.w + gx;
-    }
-    else if (p.dims == 3 && axis == 1)
-    {
-        v_offset = (ivec4(gz * 4) + ivec4(0, 1, 2, 3)) * p.outcstep + (gy + p.offset) * p.outw + gx;
-        gi = gz * p.cstep + gy * p.w + gx;
-    }
-    else if (p.dims == 3 && axis == 2)
-    {
-        v_offset = (ivec4(gz * 4) + ivec4(0, 1, 2, 3)) * p.outcstep + gy * p.outw + gx + p.offset;
-        gi = gz * p.cstep + gy * p.w + gx;
+        gxyz = ivec3(gx, gy, gz);
+        gxyz[psc(dims) - 1] *= 4;
+        gxyz[psc(dims) - 1 - positive_axis] += p.offset;
     }
 
-#if NCNN_fp16_packed
-    uvec2 v = bottom_blob_data[gi];
-    vec2 v0 = unpackHalf2x16(v.x);
-    vec2 v1 = unpackHalf2x16(v.y);
+    const int gi = gz * psc(cstep) + gy * psc(w) + gx;
 
-    top_blob_data[v_offset.r] = v0.x;
-    top_blob_data[v_offset.g] = v0.y;
-    top_blob_data[v_offset.b] = v1.x;
-    top_blob_data[v_offset.a] = v1.y;
-#else
-    top_blob_data[v_offset.r] = bottom_blob_data[gi].r;
-    top_blob_data[v_offset.g] = bottom_blob_data[gi].g;
-    top_blob_data[v_offset.b] = bottom_blob_data[gi].b;
-    top_blob_data[v_offset.a] = bottom_blob_data[gi].a;
-#endif
+    int v_offset_0 = gxyz.z * psc(outcstep) + gxyz.y * psc(outw) + gxyz.x;
+
+    ivec4 gxydz4;
+
+    if (psc(dims) == 4)
+    {
+        gxydz4 = ivec4(1, psc(outw), psc(outw) * psc(outh), psc(outcstep));
+    }
+    else
+    {
+        gxydz4 = ivec4(1, psc(outw), psc(outcstep), 0);
+    }
+
+    ivec4 v_offset = v_offset_0 + ivec4(0, 1, 2, 3) * gxydz4[psc(dims) - 1 - positive_axis];
+
+    buffer_cp4to1(top_blob_data, v_offset, bottom_blob_data, gi);
 }

@@ -1,23 +1,9 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2017 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "batchnorm.h"
-#include <math.h>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(BatchNorm)
 
 BatchNorm::BatchNorm()
 {
@@ -58,9 +44,11 @@ int BatchNorm::load_model(const ModelBin& mb)
     if (b_data.empty())
         return -100;
 
-    for (int i=0; i<channels; i++)
+    for (int i = 0; i < channels; i++)
     {
-        float sqrt_var = sqrt(var_data[i] + eps);
+        float sqrt_var = sqrtf(var_data[i] + eps);
+        if (sqrt_var == 0.f)
+            sqrt_var = 0.0001f; // sanitize divide by zero
         a_data[i] = bias_data[i] - slope_data[i] * mean_data[i] / sqrt_var;
         b_data[i] = slope_data[i] / sqrt_var;
     }
@@ -83,7 +71,7 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         float* ptr = bottom_top_blob;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int i=0; i<w; i++)
+        for (int i = 0; i < w; i++)
         {
             ptr[i] = b_data[i] * ptr[i] + a_data[i];
         }
@@ -95,33 +83,35 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         int h = bottom_top_blob.h;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int i=0; i<h; i++)
+        for (int i = 0; i < h; i++)
         {
             float* ptr = bottom_top_blob.row(i);
             float a = a_data[i];
             float b = b_data[i];
 
-            for (int j=0; j<w; j++)
+            for (int j = 0; j < w; j++)
             {
                 ptr[j] = b * ptr[j] + a;
             }
         }
     }
 
-    if (dims == 3)
+    if (dims == 3 || dims == 4)
     {
         int w = bottom_top_blob.w;
         int h = bottom_top_blob.h;
-        int size = w * h;
+        int d = bottom_top_blob.d;
+        int c = bottom_top_blob.c;
+        int size = w * h * d;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < c; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
             float a = a_data[q];
             float b = b_data[q];
 
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 ptr[i] = b * ptr[i] + a;
             }

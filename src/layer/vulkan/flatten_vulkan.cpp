@@ -1,26 +1,16 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "flatten_vulkan.h"
 
-namespace ncnn {
+#include "layer_shader_type.h"
 
-DEFINE_LAYER_CREATOR(Flatten_vulkan)
+namespace ncnn {
 
 Flatten_vulkan::Flatten_vulkan()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     pipeline_flatten = 0;
     pipeline_flatten_pack4 = 0;
@@ -29,27 +19,51 @@ Flatten_vulkan::Flatten_vulkan()
 
 int Flatten_vulkan::create_pipeline(const Option& opt)
 {
-    std::vector<vk_specialization_type> specializations;
+    const Mat& shape = bottom_shapes.empty() ? Mat() : bottom_shapes[0];
+    const Mat& out_shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
+    std::vector<vk_specialization_type> specializations(0 + 10);
+    specializations[0 + 0].i = std::min(3, shape.dims);
+    specializations[0 + 1].i = shape.w;
+    specializations[0 + 2].i = shape.h * shape.d;
+    specializations[0 + 3].i = shape.c;
+    specializations[0 + 4].i = shape.cstep;
+    specializations[0 + 5].i = std::min(3, out_shape.dims);
+    specializations[0 + 6].i = out_shape.w;
+    specializations[0 + 7].i = out_shape.h * out_shape.d;
+    specializations[0 + 8].i = out_shape.c;
+    specializations[0 + 9].i = out_shape.cstep;
+
+    Mat local_size_xyz(64, 1, 1, (void*)0);
+    if (out_shape.dims != 0)
+    {
+        local_size_xyz.w = std::min(64, out_shape.w);
+        local_size_xyz.h = 1;
+        local_size_xyz.c = 1;
+    }
 
     // pack1
+    if (shape.dims == 0 || (shape.elempack == 1 && out_shape.elempack == 1))
     {
         pipeline_flatten = new Pipeline(vkdev);
-        pipeline_flatten->set_optimal_local_size_xyz();
-        pipeline_flatten->create("flatten", opt, specializations, 2, 10);
+        pipeline_flatten->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_flatten->create(LayerShaderType::flatten, opt, specializations);
     }
 
     // pack4
+    if (shape.dims == 0 || (shape.elempack == 4 && out_shape.elempack == 4))
     {
         pipeline_flatten_pack4 = new Pipeline(vkdev);
-        pipeline_flatten_pack4->set_optimal_local_size_xyz();
-        pipeline_flatten_pack4->create("flatten_pack4", opt, specializations, 2, 10);
+        pipeline_flatten_pack4->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_flatten_pack4->create(LayerShaderType::flatten_pack4, opt, specializations);
     }
 
     // pack1to4
+    if (shape.dims == 0 || (shape.elempack == 1 && out_shape.elempack == 4))
     {
         pipeline_flatten_pack1to4 = new Pipeline(vkdev);
-        pipeline_flatten_pack1to4->set_optimal_local_size_xyz();
-        pipeline_flatten_pack1to4->create("flatten_pack1to4", opt, specializations, 2, 10);
+        pipeline_flatten_pack1to4->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_flatten_pack1to4->create(LayerShaderType::flatten_pack1to4, opt, specializations);
     }
 
     return 0;
@@ -81,20 +95,15 @@ int Flatten_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
+    int d = bottom_blob.d;
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    int total = w * h * channels * elempack;
+    int total = w * h * d * channels * elempack;
 
     int out_elempack = total % 4 == 0 ? 4 : 1;
     size_t out_elemsize = elemsize / elempack * out_elempack;
-
-    if (opt.use_fp16_packed && !opt.use_fp16_storage)
-    {
-        if (out_elempack == 4) out_elemsize = 4*2u;
-        if (out_elempack == 1) out_elemsize = 4u;
-    }
 
     if (dims == 2 && elempack == 1)
     {
@@ -102,13 +111,13 @@ int Flatten_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
         top_blob.dims = 1;
         top_blob.w = total / out_elempack;
         top_blob.h = 1;
-        top_blob.cstep = top_blob.w;
+        top_blob.cstep = bottom_blob.cstep * elempack / out_elempack;
         top_blob.elemsize = out_elemsize;
         top_blob.elempack = out_elempack;
         return 0;
     }
 
-    top_blob.create(total / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator, opt.staging_vkallocator);
+    top_blob.create(total / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
     if (top_blob.empty())
         return -100;
 
@@ -117,14 +126,14 @@ int Flatten_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     bindings[1] = top_blob;
 
     std::vector<vk_constant_type> constants(10);
-    constants[0].i = bottom_blob.dims;
+    constants[0].i = std::min(3, bottom_blob.dims);
     constants[1].i = bottom_blob.w;
-    constants[2].i = bottom_blob.h;
+    constants[2].i = bottom_blob.h * bottom_blob.d;
     constants[3].i = bottom_blob.c;
     constants[4].i = bottom_blob.cstep;
-    constants[5].i = top_blob.dims;
+    constants[5].i = std::min(3, top_blob.dims);
     constants[6].i = top_blob.w;
-    constants[7].i = top_blob.h;
+    constants[7].i = top_blob.h * top_blob.d;
     constants[8].i = top_blob.c;
     constants[9].i = top_blob.cstep;
 
@@ -133,7 +142,7 @@ int Flatten_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     {
         pipeline = pipeline_flatten;
     }
-    else if (elempack == 4 /*&& out_elempack == 4*/)
+    else if (elempack == 4 && out_elempack == 4)
     {
         pipeline = pipeline_flatten_pack4;
     }

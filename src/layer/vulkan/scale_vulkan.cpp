@@ -1,26 +1,16 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "scale_vulkan.h"
 
-namespace ncnn {
+#include "layer_shader_type.h"
 
-DEFINE_LAYER_CREATOR(Scale_vulkan)
+namespace ncnn {
 
 Scale_vulkan::Scale_vulkan()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     pipeline_scale = 0;
     pipeline_scale_pack4 = 0;
@@ -28,42 +18,102 @@ Scale_vulkan::Scale_vulkan()
 
 int Scale_vulkan::create_pipeline(const Option& opt)
 {
+    const Mat& shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
     if (scale_data_size == -233)
     {
-        std::vector<vk_specialization_type> specializations(1);
+        std::vector<vk_specialization_type> specializations(1 + 5);
         specializations[0].i = 0;
+        specializations[1 + 0].i = shape.dims;
+        specializations[1 + 1].i = shape.w;
+        specializations[1 + 2].i = shape.h;
+        specializations[1 + 3].i = shape.c;
+        specializations[1 + 4].i = shape.cstep;
 
-        pipeline_scale = new Pipeline(vkdev);
-        pipeline_scale->set_optimal_local_size_xyz();
-        pipeline_scale->create("scale", opt, specializations, 3, 5);
+        Mat local_size_xyz;
+        if (shape.dims == 1)
+        {
+            local_size_xyz.w = std::min(64, shape.w);
+            local_size_xyz.h = 1;
+            local_size_xyz.c = 1;
+        }
+        if (shape.dims == 2)
+        {
+            local_size_xyz.w = std::min(8, shape.w);
+            local_size_xyz.h = std::min(8, shape.h);
+            local_size_xyz.c = 1;
+        }
+        if (shape.dims == 3)
+        {
+            local_size_xyz.w = std::min(4, shape.w);
+            local_size_xyz.h = std::min(4, shape.h);
+            local_size_xyz.c = std::min(4, shape.c);
+        }
+
+        // pack1
+        if (shape.dims == 0 || shape.elempack == 1)
+        {
+            pipeline_scale = new Pipeline(vkdev);
+            pipeline_scale->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_scale->create(LayerShaderType::scale, opt, specializations);
+        }
 
         // pack4
+        if (shape.dims == 0 || shape.elempack == 4)
         {
             pipeline_scale_pack4 = new Pipeline(vkdev);
-            pipeline_scale_pack4->set_optimal_local_size_xyz();
-            pipeline_scale_pack4->create("scale_pack4", opt, specializations, 3, 5);
+            pipeline_scale_pack4->set_optimal_local_size_xyz(local_size_xyz);
+            pipeline_scale_pack4->create(LayerShaderType::scale_pack4, opt, specializations);
         }
 
         return 0;
     }
 
-    std::vector<vk_specialization_type> specializations(1);
+    int elempack = shape.elempack;
+    if (elempack == 0) elempack = scale_data_size % 4 == 0 ? 4 : 1;
+
+    std::vector<vk_specialization_type> specializations(1 + 5);
     specializations[0].i = bias_term;
+    specializations[1 + 0].i = shape.dims;
+    specializations[1 + 1].i = shape.w;
+    specializations[1 + 2].i = shape.h;
+    specializations[1 + 3].i = shape.c;
+    specializations[1 + 4].i = shape.cstep;
+
+    Mat local_size_xyz(4, 4, std::min(4, scale_data_size / elempack), (void*)0);
+    if (shape.dims == 1)
+    {
+        local_size_xyz.w = std::min(64, shape.w);
+        local_size_xyz.h = 1;
+        local_size_xyz.c = 1;
+    }
+    if (shape.dims == 2)
+    {
+        local_size_xyz.w = std::min(8, shape.w);
+        local_size_xyz.h = std::min(8, shape.h);
+        local_size_xyz.c = 1;
+    }
+    if (shape.dims == 3)
+    {
+        local_size_xyz.w = std::min(4, shape.w);
+        local_size_xyz.h = std::min(4, shape.h);
+        local_size_xyz.c = std::min(4, shape.c);
+    }
 
     // pack1
-    if (scale_data_size % 4 != 0)
+    if (elempack == 1)
     {
         pipeline_scale = new Pipeline(vkdev);
-        pipeline_scale->set_optimal_local_size_xyz(8, 8, scale_data_size);
-        pipeline_scale->create("scale", opt, specializations, 3, 5);
+        pipeline_scale->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_scale->create(LayerShaderType::scale, opt, specializations);
     }
 
     // pack4
-    if (scale_data_size % 4 == 0)
+    if (elempack == 4)
     {
         pipeline_scale_pack4 = new Pipeline(vkdev);
-        pipeline_scale_pack4->set_optimal_local_size_xyz(8, 8, scale_data_size / 4);
-        pipeline_scale_pack4->create("scale_pack4", opt, specializations, 3, 5);
+        pipeline_scale_pack4->set_optimal_local_size_xyz(local_size_xyz);
+        pipeline_scale_pack4->create(LayerShaderType::scale_pack4, opt, specializations);
     }
 
     return 0;
@@ -85,35 +135,17 @@ int Scale_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
     if (scale_data_size == -233)
         return 0;
 
-    // pack1
-    if (scale_data_size % 4 != 0)
-    {
-        cmd.record_upload(scale_data, scale_data_gpu, opt);
-    }
-
-    // pack4
-    if (scale_data_size % 4 == 0)
-    {
-        Mat scale_data_pack4;
-        convert_packing(scale_data, scale_data_pack4, 4);
-        cmd.record_upload(scale_data_pack4, scale_data_gpu_pack4, opt);
-    }
+    cmd.record_upload(scale_data, scale_data_gpu, opt);
 
     if (bias_term)
     {
-        // pack1
-        if (scale_data_size % 4 != 0)
-        {
-            cmd.record_upload(bias_data, bias_data_gpu, opt);
-        }
+        cmd.record_upload(bias_data, bias_data_gpu, opt);
+    }
 
-        // pack4
-        if (scale_data_size % 4 == 0)
-        {
-            Mat bias_data_pack4;
-            convert_packing(bias_data, bias_data_pack4, 4);
-            cmd.record_upload(bias_data_pack4, bias_data_gpu_pack4, opt);
-        }
+    if (opt.lightmode)
+    {
+        scale_data.release();
+        bias_data.release();
     }
 
     return 0;
@@ -129,7 +161,7 @@ int Scale_vulkan::forward_inplace(std::vector<VkMat>& bottom_top_blobs, VkComput
     std::vector<VkMat> bindings(3);
     bindings[0] = bottom_top_blob;
     bindings[1] = scale_blob;
-    bindings[2] = bias_term ? (elempack == 4 ? bias_data_gpu_pack4 : bias_data_gpu) : scale_blob;// TODO use dummy buffer
+    bindings[2] = bias_data_gpu;
 
     std::vector<vk_constant_type> constants(5);
     constants[0].i = bottom_top_blob.dims;
@@ -147,11 +179,9 @@ int Scale_vulkan::forward_inplace(std::vector<VkMat>& bottom_top_blobs, VkComput
 
 int Scale_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const
 {
-    int elempack = bottom_top_blob.elempack;
-
     std::vector<VkMat> bottom_top_blobs(2);
     bottom_top_blobs[0] = bottom_top_blob;
-    bottom_top_blobs[1] = elempack == 4 ? scale_data_gpu_pack4 : scale_data_gpu;
+    bottom_top_blobs[1] = scale_data_gpu;
 
     return forward_inplace(bottom_top_blobs, cmd, opt);
 }

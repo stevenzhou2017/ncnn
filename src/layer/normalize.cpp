@@ -1,24 +1,9 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2017 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "normalize.h"
-#include <math.h>
-#include <algorithm>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(Normalize)
 
 Normalize::Normalize()
 {
@@ -64,12 +49,12 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             return -100;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             const float* ptr = bottom_top_blob.channel(q);
 
             float ssum = 0.f;
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 ssum += ptr[i] * ptr[i];
             }
@@ -78,7 +63,7 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         }
 
         float ssum = 0.f;
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             ssum += square_sum_blob[q];
         }
@@ -86,11 +71,11 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         float a;
         if (eps_mode == 0) // caffe/mxnet
         {
-            a = 1.f / sqrt(ssum + eps);
+            a = 1.f / sqrtf(ssum + eps);
         }
         else if (eps_mode == 1) // pytorch
         {
-            a = 1.f / std::max((float)sqrt(ssum), eps);
+            a = 1.f / std::max(sqrtf(ssum), eps);
         }
         else //if (eps_mode == 2) // tensorflow
         {
@@ -102,11 +87,11 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             float scale = a * scale_data[0];
 
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] = ptr[i] * scale;
                 }
@@ -115,12 +100,12 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         else
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
                 float scale = a * scale_data[q];
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] = ptr[i] * scale;
                 }
@@ -133,12 +118,12 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
     if (across_spatial && !across_channel)
     {
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
 
             float ssum = 0.f;
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 ssum += ptr[i] * ptr[i];
             }
@@ -146,20 +131,20 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             float a;
             if (eps_mode == 0) // caffe/mxnet
             {
-                a = 1.f / sqrt(ssum + eps);
+                a = 1.f / sqrtf(ssum + eps);
             }
             else if (eps_mode == 1) // pytorch
             {
-                a = 1.f / std::max((float)sqrt(ssum), eps);
+                a = 1.f / std::max(sqrtf(ssum), eps);
             }
             else //if (eps_mode == 2) // tensorflow
             {
-                a = 1.f / sqrt(std::max(ssum, eps));
+                a = 1.f / sqrtf(std::max(ssum, eps));
             }
 
             float scale = a * (channel_shared ? scale_data[0] : scale_data[q]);
 
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 ptr[i] = ptr[i] * scale;
             }
@@ -181,10 +166,10 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             float scale = scale_data[0];
 
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 float ssum = 0.f;
-                for (int q=0; q<channels; q++)
+                for (int q = 0; q < channels; q++)
                 {
                     const float* ptr = bottom_top_blob.channel(q);
                     ssum += ptr[i] * ptr[i];
@@ -193,7 +178,7 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
                 float a;
                 if (eps_mode == 0) // caffe/mxnet
                 {
-                    a = 1.f / sqrt(ssum + eps);
+                    a = 1.f / sqrtf(ssum + eps);
                 }
                 else if (eps_mode == 1) // pytorch
                 {
@@ -201,18 +186,18 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
                 }
                 else //if (eps_mode == 2) // tensorflow
                 {
-                    a = 1.f / sqrt(std::max(ssum, eps));
+                    a = 1.f / sqrtf(std::max(ssum, eps));
                 }
 
                 square_sum_blob[i] = a * scale;
             }
 
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] = ptr[i] * square_sum_blob[i];
                 }
@@ -221,10 +206,10 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         else
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 float ssum = 0.f;
-                for (int q=0; q<channels; q++)
+                for (int q = 0; q < channels; q++)
                 {
                     const float* ptr = bottom_top_blob.channel(q);
                     ssum += ptr[i] * ptr[i];
@@ -233,27 +218,27 @@ int Normalize::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
                 float a;
                 if (eps_mode == 0) // caffe/mxnet
                 {
-                    a = 1.f / sqrt(ssum + eps);
+                    a = 1.f / sqrtf(ssum + eps);
                 }
                 else if (eps_mode == 1) // pytorch
                 {
-                    a = 1.f / std::max((float)sqrt(ssum), eps);
+                    a = 1.f / std::max(sqrtf(ssum), eps);
                 }
                 else //if (eps_mode == 2) // tensorflow
                 {
-                    a = 1.f / sqrt(std::max(ssum, eps));
+                    a = 1.f / sqrtf(std::max(ssum, eps));
                 }
 
                 square_sum_blob[i] = a;
             }
 
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
                 float scale = scale_data[q];
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] = ptr[i] * square_sum_blob[i] * scale;
                 }

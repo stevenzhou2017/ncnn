@@ -1,23 +1,9 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2017 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "lrn.h"
-#include <math.h>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(LRN)
 
 LRN::LRN()
 {
@@ -51,12 +37,12 @@ int LRN::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         return -100;
 
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int q=0; q<channels; q++)
+    for (int q = 0; q < channels; q++)
     {
         const float* ptr = bottom_top_blob.channel(q);
         float* outptr = square_blob.channel(q);
 
-        for (int i=0; i<size; i++)
+        for (int i = 0; i < size; i++)
         {
             outptr[i] = ptr[i] * ptr[i];
         }
@@ -73,26 +59,26 @@ int LRN::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         const float alpha_div_size = alpha / local_size;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             // square sum
             float* ssptr = square_sum.channel(q);
-            for (int p=q - local_size / 2; p<=q + local_size / 2; p++)
+            for (int p = q - local_size / 2; p <= q + local_size / 2; p++)
             {
                 if (p < 0 || p >= channels)
                     continue;
 
                 const float* sptr = square_blob.channel(p);
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ssptr[i] += sptr[i];
                 }
             }
 
             float* ptr = bottom_top_blob.channel(q);
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
-                ptr[i] = ptr[i] * pow(bias + alpha_div_size * ssptr[i], -beta);
+                ptr[i] = ptr[i] * powf(bias + alpha_div_size * ssptr[i], -beta);
             }
         }
     }
@@ -107,6 +93,7 @@ int LRN::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         {
             Option opt_b = opt;
             opt_b.blob_allocator = opt.workspace_allocator;
+            opt_b.use_packing_layout = false;
             copy_make_border(square_blob, square_blob_bordered, pad, local_size - pad - 1, pad, local_size - pad - 1, BORDER_CONSTANT, 0.f, opt_b);
             if (square_blob_bordered.empty())
                 return -100;
@@ -139,7 +126,7 @@ int LRN::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         }
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
             const Mat m = square_blob_bordered.channel(q);
@@ -154,11 +141,11 @@ int LRN::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
                     for (int k = 0; k < maxk; k++)
                     {
-                        float val = sptr[ space_ofs[k] ];
+                        float val = sptr[space_ofs[k]];
                         ss += val;
                     }
 
-                    ptr[j] = ptr[j] * pow(bias + alpha_div_size * ss, -beta);
+                    ptr[j] = ptr[j] * powf(bias + alpha_div_size * ss, -beta);
                 }
 
                 ptr += outw;

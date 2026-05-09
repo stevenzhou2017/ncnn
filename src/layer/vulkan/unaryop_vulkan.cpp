@@ -1,49 +1,33 @@
-// Tencent is pleased to support the open source community by making ncnn available.
-//
-// Copyright (C) 2019 THL A29 Limited, a Tencent company. All rights reserved.
-//
-// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
-// in compliance with the License. You may obtain a copy of the License at
-//
-// https://opensource.org/licenses/BSD-3-Clause
-//
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
+// Copyright 2019 Tencent
+// SPDX-License-Identifier: BSD-3-Clause
 
 #include "unaryop_vulkan.h"
 
-namespace ncnn {
+#include "layer_shader_type.h"
 
-DEFINE_LAYER_CREATOR(UnaryOp_vulkan)
+namespace ncnn {
 
 UnaryOp_vulkan::UnaryOp_vulkan()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     pipeline_unaryop = 0;
-    pipeline_unaryop_pack4 = 0;
 }
 
 int UnaryOp_vulkan::create_pipeline(const Option& opt)
 {
-    std::vector<vk_specialization_type> specializations(1);
+    const Mat& shape = top_shapes.empty() ? Mat() : top_shapes[0];
+
+    std::vector<vk_specialization_type> specializations(2);
     specializations[0].i = op_type;
+    specializations[1].u32 = shape.total() * shape.elempack / 4;
 
-    // pack1
-    {
-        pipeline_unaryop = new Pipeline(vkdev);
-        pipeline_unaryop->set_optimal_local_size_xyz();
-        pipeline_unaryop->create("unaryop", opt, specializations, 1, 5);
-    }
+    const int local_size_x = vkdev->info.subgroup_size();
 
-    // pack4
-    {
-        pipeline_unaryop_pack4 = new Pipeline(vkdev);
-        pipeline_unaryop_pack4->set_optimal_local_size_xyz();
-        pipeline_unaryop_pack4->create("unaryop_pack4", opt, specializations, 1, 5);
-    }
+    pipeline_unaryop = new Pipeline(vkdev);
+    pipeline_unaryop->set_optimal_local_size_xyz(local_size_x, 1, 1);
+    pipeline_unaryop->create(LayerShaderType::unaryop, opt, specializations);
 
     return 0;
 }
@@ -53,29 +37,24 @@ int UnaryOp_vulkan::destroy_pipeline(const Option& /*opt*/)
     delete pipeline_unaryop;
     pipeline_unaryop = 0;
 
-    delete pipeline_unaryop_pack4;
-    pipeline_unaryop_pack4 = 0;
-
     return 0;
 }
 
 int UnaryOp_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& /*opt*/) const
 {
-    int elempack = bottom_top_blob.elempack;
+    const size_t n = bottom_top_blob.total() * bottom_top_blob.elempack / 4;
 
     std::vector<VkMat> bindings(1);
     bindings[0] = bottom_top_blob;
 
-    std::vector<vk_constant_type> constants(5);
-    constants[0].i = bottom_top_blob.dims;
-    constants[1].i = bottom_top_blob.w;
-    constants[2].i = bottom_top_blob.h;
-    constants[3].i = bottom_top_blob.c;
-    constants[4].i = bottom_top_blob.cstep;
+    std::vector<vk_constant_type> constants(1);
+    constants[0].u32 = n;
 
-    const Pipeline* pipeline = elempack == 4 ? pipeline_unaryop_pack4 : pipeline_unaryop;
-
-    cmd.record_pipeline(pipeline, bindings, constants, bottom_top_blob);
+    VkMat dispatcher;
+    dispatcher.w = n;
+    dispatcher.h = 1;
+    dispatcher.c = 1;
+    cmd.record_pipeline(pipeline_unaryop, bindings, constants, dispatcher);
 
     return 0;
 }
